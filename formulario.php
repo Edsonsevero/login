@@ -106,7 +106,7 @@ body {
     font-family: Arial, Helvetica, sans-serif;
     background: linear-gradient(to right, rgb(20,147,220), rgb(17,54,71));
     margin: 0;
-    height: 100vh;
+    min-height: 100vh;
     display: flex;
     justify-content: center;
     align-items: center;
@@ -122,56 +122,65 @@ body {
     box-sizing:border-box;
 }
 input, select {
-    padding:15px; 
-    border:none; 
-    outline:none; 
-    font-size:15px; 
-    width:100%; 
-    border-radius:8px; 
-    margin-bottom:15px; 
+    padding:1em;
+    border:none;
+    outline:none;
+    font-size:1em;
+    width:100%;
+    border-radius:8px;
+    margin-bottom:15px;
     box-sizing:border-box;
 }
 .inputSubmit {
     background-color:dodgerblue;
-    padding:15px;
+    padding:1em;
     border:none;
     color:white;
     width:100%;
     border-radius:10px;
-    font-size:15px;
+    font-size:1em;
     transition:0.3s;
 }
 .inputSubmit:hover {
-    background-color:deepskyblue; 
+    background-color:deepskyblue;
     cursor:pointer;
 }
 .alerta {
-    background:red; 
-    color:white; 
-    padding:10px; 
-    margin-bottom:15px; 
+    background:red;
+    color:white;
+    padding:10px;
+    margin-bottom:15px;
     border-radius:5px;
 }
 .cadastro-link {
-    display:block; 
-    text-align:center; 
-    margin-top:15px; 
-    color:white; 
+    display:block;
+    text-align:center;
+    margin-top:15px;
+    color:white;
     text-decoration:none;
 }
 .cadastro-link:hover {
     text-decoration:underline;
 }
 
-/* Responsivo para telas pequenas */
-@media(max-width:600px){
+/* Responsivo */
+@media(max-width:768px){
     .telaCadastro {
         padding:20px;
         width:95%;
     }
     input, select, .inputSubmit {
         padding:12px;
-        font-size:14px;
+        font-size:0.9em;
+    }
+}
+@media(max-width:480px){
+    .telaCadastro {
+        padding:15px;
+    }
+    input, select, .inputSubmit {
+        padding:10px;
+        font-size:0.85em;
     }
 }
 </style>
