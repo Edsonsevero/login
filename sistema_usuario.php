@@ -167,7 +167,125 @@ if(isset($_POST['update_profile'])){
         }
     }
 }
+// Upload de arquivos - MODIFICADO
+if(isset($_POST['upload_arquivo']) && isset($_FILES['arquivo']) && $_FILES['arquivo']['error'] == 0){
+    $arquivo = $_FILES['arquivo'];
+    $descricao = trim($_POST['descricao_arquivo'] ?? '');
+    $tarefa_id = isset($_POST['tarefa_id']) ? intval($_POST['tarefa_id']) : null;
+    
+    // Validação básica
+    if($arquivo['size'] > 10 * 1024 * 1024) {
+        $erro_arquivo = "Arquivo muito grande. Máximo 10MB.";
+    } else {
+        // Gera nome único
+        $ext = strtolower(pathinfo($arquivo['name'], PATHINFO_EXTENSION));
+        $nomeArquivo = 'arquivo_' . $_SESSION['id'] . '_' . time() . '.' . $ext;
+        
+        if(!is_dir('uploads/arquivos')){ 
+            mkdir('uploads/arquivos', 0755, true); 
+        }
+        
+        $caminho = 'uploads/arquivos/' . $nomeArquivo;
+        
+        if(move_uploaded_file($arquivo['tmp_name'], $caminho)){
+            // Salva no banco
+            $stmt = $conexao->prepare("
+                INSERT INTO arquivos_usuarios (user_id, nome_arquivo, nome_original, tipo, tamanho, descricao) 
+                VALUES (?, ?, ?, ?, ?, ?)
+            ");
+            $stmt->bind_param("isssis", $_SESSION['id'], $nomeArquivo, $arquivo['name'], $arquivo['type'], $arquivo['size'], $descricao);
+            
+            if($stmt->execute()){
+                $arquivo_id = $stmt->insert_id;
+                
+                // Se foi enviado com uma tarefa, associa o arquivo à tarefa
+                if($tarefa_id){
+                    $stmt2 = $conexao->prepare("UPDATE tarefas SET arquivo_id = ? WHERE id = ? AND user_id = ?");
+                    $stmt2->bind_param("iii", $arquivo_id, $tarefa_id, $_SESSION['id']);
+                    $stmt2->execute();
+                    $stmt2->close();
+                }
+                
+                $sucesso_arquivo = "Arquivo enviado com sucesso!" . ($tarefa_id ? " Vinculado à tarefa." : "");
+            }
+            $stmt->close();
+        } else {
+            $erro_arquivo = "Erro ao fazer upload do arquivo.";
+        }
+    }
+}
 
+// Excluir arquivo - CORRIGIDO
+if(isset($_GET['excluir_arquivo'])){
+    $arquivo_id = intval($_GET['excluir_arquivo']);
+    
+    // Busca informações do arquivo
+    $stmt = $conexao->prepare("SELECT nome_arquivo FROM arquivos_usuarios WHERE id = ? AND user_id = ?");
+    $stmt->bind_param("ii", $arquivo_id, $_SESSION['id']);
+    $stmt->execute();
+    $stmt->store_result(); // ← ADICIONE ESTA LINHA
+    $stmt->bind_result($nome_arquivo);
+    
+    if($stmt->fetch()){
+        $caminho_arquivo = 'uploads/arquivos/' . $nome_arquivo;
+        
+        // Fecha o statement ANTES de executar o próximo
+        $stmt->close();
+        
+        // Remove do banco
+        $stmt2 = $conexao->prepare("DELETE FROM arquivos_usuarios WHERE id = ? AND user_id = ?");
+        $stmt2->bind_param("ii", $arquivo_id, $_SESSION['id']);
+        $stmt2->execute();
+        $stmt2->close();
+        
+        // Remove arquivo físico
+        if(file_exists($caminho_arquivo)){
+            unlink($caminho_arquivo);
+        }
+        
+        // Redireciona para evitar reexecução
+        header("Location: sistema_usuario.php");
+        exit;
+    } else {
+        $stmt->close();
+    }
+}
+
+// Buscar arquivos do usuário
+$stmt = $conexao->prepare("
+    SELECT id, nome_arquivo, nome_original, tipo, tamanho, descricao, data_upload 
+    FROM arquivos_usuarios 
+    WHERE user_id = ? 
+    ORDER BY data_upload DESC
+");
+$stmt->bind_param("i", $_SESSION['id']);
+$stmt->execute();
+$result = $stmt->get_result();
+$arquivos = $result->fetch_all(MYSQLI_ASSOC);
+
+// Funções auxiliares
+function getFileIcon($tipo) {
+    if(strpos($tipo, 'image/') !== false) return '🖼️';
+    if(strpos($tipo, 'video/') !== false) return '🎬';
+    if(strpos($tipo, 'audio/') !== false) return '🎵';
+    if(strpos($tipo, 'pdf') !== false) return '📄';
+    if(strpos($tipo, 'word') !== false) return '📝';
+    if(strpos($tipo, 'excel') !== false) return '📊';
+    if(strpos($tipo, 'zip') !== false || strpos($tipo, 'rar') !== false) return '📦';
+    return '📁';
+}
+
+function formatFileSize($bytes) {
+    if ($bytes >= 1073741824) {
+        return number_format($bytes / 1073741824, 2) . ' GB';
+    } elseif ($bytes >= 1048576) {
+        return number_format($bytes / 1048576, 2) . ' MB';
+    } elseif ($bytes >= 1024) {
+        return number_format($bytes / 1024, 2) . ' KB';
+    } else {
+        return $bytes . ' bytes';
+    }
+}
 // Adicionar tarefa
 if(isset($_POST['add_tarefa']) && !empty($_POST['descricao'])){
     $prioridade = $_POST['prioridade'] ?? 'media';
@@ -206,7 +324,12 @@ $ordenacao = $_GET['ordenar'] ?? 'data_criacao';
 $filtro_categoria = $_GET['categoria'] ?? 'todas';
 $filtro_status = $_GET['status'] ?? 'todas';
 
-$sql_tarefas = "SELECT id, descricao, concluida, prioridade, categoria, data_criacao, data_conclusao FROM tarefas WHERE user_id = ?";
+// Buscar tarefas do usuário com ordenação - MODIFICADO
+$sql_tarefas = "SELECT t.id, t.descricao, t.concluida, t.prioridade, t.categoria, t.data_criacao, t.data_conclusao, 
+                t.arquivo_id, a.nome_original, a.tipo, a.descricao as descricao_arquivo
+                FROM tarefas t 
+                LEFT JOIN arquivos_usuarios a ON t.arquivo_id = a.id 
+                WHERE t.user_id = ?";
 $params = [$_SESSION['id']];
 $tipos = "i";
 
@@ -932,27 +1055,50 @@ body {
                     <button type="submit" name="add_tarefa" class="btn btn-success">Adicionar</button>
                 </form>
 
-                <div class="task-list">
-                    <?php foreach($tarefas as $tarefa): ?>
-                    <div class="task-item <?php echo $tarefa['concluida'] ? 'concluida' : ''; ?>">
-                        <div class="task-info">
-                            <div class="task-desc"><?php echo htmlspecialchars($tarefa['descricao']); ?></div>
-                            <div class="task-meta">
-                                <span class="task-priority priority-<?php echo $tarefa['prioridade']; ?>">
-                                    <?php echo ucfirst($tarefa['prioridade']); ?>
-                                </span>
-                                <span class="task-category"><?php echo ucfirst($tarefa['categoria']); ?></span>
-                                <span class="task-date"><?php echo date('d/m/Y', strtotime($tarefa['data_criacao'])); ?></span>
-                            </div>
-                        </div>
-                        <div class="task-actions">
-                            <?php if(!$tarefa['concluida']): ?>
-                                <a href="?concluir=<?php echo $tarefa['id']; ?>" class="btn btn-success btn-sm">Concluir</a>
-                            <?php endif; ?>
-                            <a href="?excluir=<?php echo $tarefa['id']; ?>" class="btn btn-danger btn-sm" onclick="return confirm('Tem certeza que deseja excluir esta tarefa?')">Excluir</a>
-                        </div>
+               <div class="task-list">
+    <?php foreach($tarefas as $tarefa): ?>
+    <div class="task-item <?php echo $tarefa['concluida'] ? 'concluida' : ''; ?>">
+        <div class="task-info">
+            <div class="task-desc">
+                <?php echo htmlspecialchars($tarefa['descricao']); ?>
+                <?php if($tarefa['arquivo_id']): ?>
+                    <div style="margin-top: 8px;">
+                        <span style="background: var(--info-color); color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.8rem;">
+                            📎 <?php echo htmlspecialchars($tarefa['nome_original']); ?>
+                        </span>
+                        <?php if($tarefa['descricao_arquivo']): ?>
+                            <small style="color: var(--secondary-color); margin-left: 8px;">
+                                <?php echo htmlspecialchars($tarefa['descricao_arquivo']); ?>
+                            </small>
+                        <?php endif; ?>
                     </div>
-                    <?php endforeach; ?>
+                <?php endif; ?>
+            </div>
+            <div class="task-meta">
+                <span class="task-priority priority-<?php echo $tarefa['prioridade']; ?>">
+                    <?php echo ucfirst($tarefa['prioridade']); ?>
+                </span>
+                <span class="task-category"><?php echo ucfirst($tarefa['categoria']); ?></span>
+                <span class="task-date"><?php echo date('d/m/Y', strtotime($tarefa['data_criacao'])); ?></span>
+            </div>
+        </div>
+        <div class="task-actions">
+            <?php if($tarefa['arquivo_id']): ?>
+                <a href="download.php?id=<?php echo $tarefa['arquivo_id']; ?>" class="btn btn-info btn-sm">Abrir Arquivo</a>
+            <?php endif; ?>
+            
+            <!-- Botão para adicionar/alterar arquivo -->
+            <button class="btn btn-secondary btn-sm" onclick="abrirUploadArquivo(<?php echo $tarefa['id']; ?>, '<?php echo htmlspecialchars($tarefa['descricao']); ?>')">
+                <?php echo $tarefa['arquivo_id'] ? '📎 Alterar' : '📎 Anexar'; ?>
+            </button>
+            
+            <?php if(!$tarefa['concluida']): ?>
+                <a href="?concluir=<?php echo $tarefa['id']; ?>" class="btn btn-success btn-sm">Concluir</a>
+            <?php endif; ?>
+            <a href="?excluir=<?php echo $tarefa['id']; ?>" class="btn btn-danger btn-sm" onclick="return confirm('Tem certeza que deseja excluir esta tarefa?')">Excluir</a>
+        </div>
+    </div>
+    <?php endforeach; ?>
                     
                     <?php if(empty($tarefas)): ?>
                     <div class="task-item" style="text-align: center; padding: 40px;">
@@ -996,6 +1142,7 @@ body {
             <button class="modal-tab" onclick="openTab(event, 'tabSeguranca')">Segurança</button>
             <button class="modal-tab" onclick="openTab(event, 'tabFoto')">Foto</button>
             <button class="modal-tab" onclick="openTab(event, 'tabPreferencias')">Preferências</button>
+            <button class="modal-tab" onclick="openTab(event, 'tabArquivos')">Arquivos</button>
         </div>
 
         <!-- Aba Informações -->
@@ -1131,8 +1278,85 @@ body {
             </form>
         </div>
     </div>
-</div>
+                 <!-- Aba Documentos -->
+        <div id="tabArquivos" class="tab-content">
+            <h3 style="margin-bottom: 20px;">Meus Documentos</h3>
+            
+            <?php if(isset($sucesso_arquivo)): ?>
+                <div class="alert alert-success"><?php echo $sucesso_arquivo; ?></div>
+            <?php endif; ?>
+            
+            <?php if(isset($erro_arquivo)): ?>
+                <div class="alert alert-error"><?php echo $erro_arquivo; ?></div>
+            <?php endif; ?>
+            
+            <!-- Formulário de Upload -->
+            <form method="post" enctype="multipart/form-data" class="modal-form">
+                <div class="form-group">
+                    <label class="form-label">Adicionar Documento</label>
+                    <div class="photo-upload" onclick="document.getElementById('arquivoInput').click()">
+                        <input type="file" name="arquivo" id="arquivoInput" style="display: none;" onchange="previewArquivo()">
+                        <p>📄 Clique para selecionar um documento</p>
+                        <small style="color: var(--secondary-color);">Planilhas, PDFs, Manuais, etc. (Máx. 10MB)</small>
+                    </div>
+                    <div id="arquivoPreview" class="foto-preview">
+                        <p id="arquivoNome"></p>
+                        <small id="arquivoTamanho"></small>
+                    </div>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Tipo de Documento</label>
+                    <select name="descricao_arquivo" class="form-select">
+                        <option value="">Selecione o tipo...</option>
+                        <option value="📊 Planilha">Planilha</option>
+                        <option value="📄 PDF">PDF</option>
+                        <option value="📋 Relatório">Relatório</option>
+                        <option value="📖 Manual">Manual</option>
+                        <option value="📑 Documento">Documento Geral</option>
+                        <option value="📝 Anotação">Anotações</option>
+                        <option value="📈 Gráfico">Gráfico</option>
+                    </select>
+                </div>
+                
+                <button type="submit" name="upload_arquivo" class="btn btn-primary">Salvar Documento</button>
+            </form>
 
+            <!-- Lista de Documentos -->
+            <div style="margin-top: 30px;">
+                <h4>Documentos Salvos</h4>
+                <div id="listaArquivos" class="task-list">
+                    <?php if(empty($arquivos)): ?>
+                        <p style="text-align: center; color: var(--secondary-color); padding: 20px;">
+                            Nenhum documento salvo ainda.
+                        </p>
+                    <?php else: ?>
+                        <?php foreach($arquivos as $arquivo): ?>
+                        <div class="task-item">
+                            <div class="task-info">
+                                <div class="task-desc">
+                                    <?php 
+                                    $icone = getFileIcon($arquivo['tipo']);
+                                    echo $icone . ' ' . htmlspecialchars($arquivo['nome_original']); 
+                                    ?>
+                                </div>
+                                <div class="task-meta">
+                                    <span><strong><?php echo !empty($arquivo['descricao']) ? $arquivo['descricao'] : '📄 Documento'; ?></strong></span>
+                                    <span><?php echo formatFileSize($arquivo['tamanho']); ?></span>
+                                    <span><?php echo date('d/m/Y H:i', strtotime($arquivo['data_upload'])); ?></span>
+                                </div>
+                            </div>
+                            <div class="task-actions">
+                                <a href="download.php?id=<?php echo $arquivo['id']; ?>" class="btn btn-success btn-sm">Abrir</a>
+                                <a href="?excluir_arquivo=<?php echo $arquivo['id']; ?>" class="btn btn-danger btn-sm" 
+                                   onclick="return confirm('Tem certeza que deseja excluir este documento?')">Excluir</a>
+                            </div>
+                        </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
 <script>
 // Modal Functions
 function openModal(){ 
@@ -1270,6 +1494,102 @@ document.addEventListener('DOMContentLoaded', function() {
         document.body.classList.add('dark-theme');
     }
 });
+// Preview do arquivo
+function previewArquivo() {
+    const input = document.getElementById('arquivoInput');
+    const preview = document.getElementById('arquivoPreview');
+    const nome = document.getElementById('arquivoNome');
+    const tamanho = document.getElementById('arquivoTamanho');
+    
+    if (input.files && input.files[0]) {
+        const file = input.files[0];
+        nome.textContent = file.name;
+        tamanho.textContent = formatFileSizeJS(file.size);
+        preview.style.display = 'block';
+    }
+}
+
+// Formatar tamanho do arquivo em JS
+function formatFileSizeJS(bytes) {
+    if (bytes >= 1073741824) {
+        return (bytes / 1073741824).toFixed(2) + ' GB';
+    } else if (bytes >= 1048576) {
+        return (bytes / 1048576).toFixed(2) + ' MB';
+    } else if (bytes >= 1024) {
+        return (bytes / 1024).toFixed(2) + ' KB';
+    } else {
+        return bytes + ' bytes';
+    }
+}
+// Modal para upload rápido de arquivo na tarefa
+function abrirUploadArquivo(tarefaId, tarefaDescricao) {
+    const modal = document.getElementById('modalUploadRapido');
+    if (!modal) {
+        criarModalUploadRapido();
+    }
+    
+    document.getElementById('tarefaIdUpload').value = tarefaId;
+    document.getElementById('tituloUpload').textContent = 'Anexar arquivo à tarefa: ' + tarefaDescricao;
+    document.getElementById('modalUploadRapido').style.display = 'flex';
+}
+
+function criarModalUploadRapido() {
+    const modalHTML = `
+    <div class="modal" id="modalUploadRapido">
+        <div class="modal-content" style="max-width: 500px;">
+            <span class="close-modal" onclick="fecharUploadRapido()">&times;</span>
+            <h3 id="tituloUpload" style="margin-bottom: 20px;">Anexar arquivo à tarefa</h3>
+            
+            <form method="post" enctype="multipart/form-data" class="modal-form">
+                <input type="hidden" name="tarefa_id" id="tarefaIdUpload">
+                
+                <div class="form-group">
+                    <label class="form-label">Selecionar Arquivo</label>
+                    <div class="photo-upload" onclick="document.getElementById('arquivoRapidoInput').click()">
+                        <input type="file" name="arquivo" id="arquivoRapidoInput" style="display: none;" onchange="previewArquivoRapido()">
+                        <p>📁 Clique para selecionar um arquivo</p>
+                        <small style="color: var(--secondary-color);">Máx. 10MB - Todos os tipos</small>
+                    </div>
+                    <div id="arquivoRapidoPreview" class="foto-preview">
+                        <p id="arquivoRapidoNome"></p>
+                        <small id="arquivoRapidoTamanho"></small>
+                    </div>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Descrição do arquivo (opcional)</label>
+                    <input type="text" name="descricao_arquivo" class="form-input" placeholder="Ex: Planilha de custos, Relatório final...">
+                </div>
+                
+                <div style="display: flex; gap: 10px; margin-top: 20px;">
+                    <button type="submit" name="upload_arquivo" class="btn btn-primary" style="flex: 1;">Salvar</button>
+                    <button type="button" onclick="fecharUploadRapido()" class="btn btn-secondary">Cancelar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    `;
+    
+    document.body.insertAdjacentHTML('beforeend', modalHTML);
+}
+
+function fecharUploadRapido() {
+    document.getElementById('modalUploadRapido').style.display = 'none';
+}
+
+function previewArquivoRapido() {
+    const input = document.getElementById('arquivoRapidoInput');
+    const preview = document.getElementById('arquivoRapidoPreview');
+    const nome = document.getElementById('arquivoRapidoNome');
+    const tamanho = document.getElementById('arquivoRapidoTamanho');
+    
+    if (input.files && input.files[0]) {
+        const file = input.files[0];
+        nome.textContent = file.name;
+        tamanho.textContent = formatFileSizeJS(file.size);
+        preview.style.display = 'block';
+    }
+}
 
 // Heartbeat para manter sessão
 setInterval(() => {
