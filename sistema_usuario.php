@@ -9,6 +9,65 @@ if(!isset($_SESSION['email']) || $_SESSION['role'] != 'usuario'){
 
 // Verificar e criar colunas necessárias se não existirem
 $colunas_necessarias = ['bio', 'telefone', 'data_nascimento', 'genero', 'localizacao', 'website', 'tema_preferido'];
+// =============================================
+// SISTEMA DE NOTIFICAÇÕES
+// =============================================
+
+// Marcar notificação como lida
+if(isset($_GET['marcar_lida'])) {
+    $notificacao_id = intval($_GET['marcar_lida']);
+    $stmt = $conexao->prepare("UPDATE notificacoes SET lida = 1 WHERE id = ? AND user_id = ?");
+    $stmt->bind_param("ii", $notificacao_id, $_SESSION['id']);
+    $stmt->execute();
+    $stmt->close();
+    
+    // Redireciona para evitar reexecução
+    header("Location: sistema_usuario.php");
+    exit;
+}
+
+// Marcar todas como lidas
+if(isset($_POST['marcar_todas_lidas'])) {
+    $stmt = $conexao->prepare("UPDATE notificacoes SET lida = 1 WHERE user_id = ? AND lida = 0");
+    $stmt->bind_param("i", $_SESSION['id']);
+    $stmt->execute();
+    $stmt->close();
+    
+    $sucesso_notificacao = "Todas as notificações foram marcadas como lidas!";
+}
+
+// Excluir notificação
+if(isset($_GET['excluir_notificacao'])) {
+    $notificacao_id = intval($_GET['excluir_notificacao']);
+    $stmt = $conexao->prepare("DELETE FROM notificacoes WHERE id = ? AND user_id = ?");
+    $stmt->bind_param("ii", $notificacao_id, $_SESSION['id']);
+    $stmt->execute();
+    $stmt->close();
+    
+    header("Location: sistema_usuario.php");
+    exit;
+}
+
+// Buscar notificações do usuário
+$stmt = $conexao->prepare("
+    SELECT id, titulo, mensagem, tipo, lida, data_criacao, link 
+    FROM notificacoes 
+    WHERE user_id = ? 
+    ORDER BY lida ASC, data_criacao DESC 
+    LIMIT 20
+");
+$stmt->bind_param("i", $_SESSION['id']);
+$stmt->execute();
+$result = $stmt->get_result();
+$notificacoes = $result->fetch_all(MYSQLI_ASSOC);
+
+// Contar notificações não lidas
+$notificacoes_nao_lidas = 0;
+foreach($notificacoes as $notificacao) {
+    if(!$notificacao['lida']) {
+        $notificacoes_nao_lidas++;
+    }
+}
 foreach($colunas_necessarias as $coluna) {
     try {
         $result = $conexao->query("SHOW COLUMNS FROM usuarios LIKE '$coluna'");
@@ -40,6 +99,115 @@ if(isset($_SESSION['id'])){
     $stmt->bind_param("issss", $_SESSION['id'], $ip, $user_agent, $ip, $user_agent);
     $stmt->execute();
 }
+// Buscar informações completas do usuário
+$stmt = $conexao->prepare("SELECT nome, email, foto_perfil, bio, telefone, data_nascimento, genero, localizacao, website, tema_preferido FROM usuarios WHERE id = ?");
+$stmt->bind_param("i", $_SESSION['id']);
+$stmt->execute();
+$result = $stmt->get_result();
+$usuario = $result->fetch_assoc();
+// =============================================
+// SISTEMA DE CHAT ENTRE USUÁRIOS
+// =============================================
+
+// Enviar mensagem
+if(isset($_POST['enviar_mensagem']) && !empty($_POST['mensagem']) && !empty($_POST['destinatario_id'])) {
+    $destinatario_id = intval($_POST['destinatario_id']);
+    $mensagem = trim($_POST['mensagem']);
+    
+    $stmt = $conexao->prepare("INSERT INTO mensagens_chat (remetente_id, destinatario_id, mensagem) VALUES (?, ?, ?)");
+    $stmt->bind_param("iis", $_SESSION['id'], $destinatario_id, $mensagem);
+    
+    if($stmt->execute()) {
+        $sucesso_chat = "Mensagem enviada com sucesso!";
+        
+        // Criar notificação para o destinatário
+        $stmt_notif = $conexao->prepare("
+            INSERT INTO notificacoes (user_id, titulo, mensagem, tipo, link) 
+            VALUES (?, '💬 Nova Mensagem', 'Você recebeu uma nova mensagem de " . $usuario['nome'] . "', 'info', 'sistema_usuario.php')
+        ");
+        $stmt_notif->bind_param("i", $destinatario_id);
+        $stmt_notif->execute();
+        $stmt_notif->close();
+    }
+    $stmt->close();
+}
+
+// Marcar mensagens como lidas
+if(isset($_GET['ler_mensagens'])) {
+    $remetente_id = intval($_GET['ler_mensagens']);
+    $stmt = $conexao->prepare("UPDATE mensagens_chat SET lida = 1 WHERE destinatario_id = ? AND remetente_id = ? AND lida = 0");
+    $stmt->bind_param("ii", $_SESSION['id'], $remetente_id);
+    $stmt->execute();
+    $stmt->close();
+}
+
+// Buscar usuários para conversar (exceto o próprio usuário)
+$stmt_usuarios = $conexao->prepare("SELECT id, nome, foto_perfil FROM usuarios WHERE id != ? ORDER BY nome");
+$stmt_usuarios->bind_param("i", $_SESSION['id']);
+$stmt_usuarios->execute();
+$result_usuarios = $stmt_usuarios->get_result();
+$usuarios_chat = $result_usuarios->fetch_all(MYSQLI_ASSOC);
+
+// Buscar conversas recentes
+$stmt_conversas = $conexao->prepare("
+    SELECT 
+        u.id as user_id,
+        u.nome,
+        u.foto_perfil,
+        COUNT(m.id) as total_mensagens,
+        SUM(CASE WHEN m.lida = 0 AND m.destinatario_id = ? THEN 1 ELSE 0 END) as nao_lidas,
+        MAX(m.data_envio) as ultima_mensagem
+    FROM usuarios u
+    LEFT JOIN mensagens_chat m ON (
+        (m.remetente_id = u.id AND m.destinatario_id = ?) OR 
+        (m.destinatario_id = u.id AND m.remetente_id = ?)
+    )
+    WHERE u.id != ?
+    GROUP BY u.id, u.nome, u.foto_perfil
+    HAVING total_mensagens > 0
+    ORDER BY ultima_mensagem DESC
+");
+$stmt_conversas->bind_param("iiii", $_SESSION['id'], $_SESSION['id'], $_SESSION['id'], $_SESSION['id']);
+$stmt_conversas->execute();
+$conversas = $stmt_conversas->get_result()->fetch_all(MYSQLI_ASSOC);
+
+// Buscar mensagens de uma conversa específica
+$chat_usuario = null;
+$mensagens = [];
+if(isset($_GET['chat_com'])) {
+    $chat_usuario_id = intval($_GET['chat_com']);
+    
+    // Buscar informações do usuário
+    $stmt_user = $conexao->prepare("SELECT id, nome, foto_perfil FROM usuarios WHERE id = ?");
+    $stmt_user->bind_param("i", $chat_usuario_id);
+    $stmt_user->execute();
+    $chat_usuario = $stmt_user->get_result()->fetch_assoc();
+    
+    // Buscar mensagens da conversa
+    $stmt_msg = $conexao->prepare("
+        SELECT m.*, u.nome as remetente_nome, u.foto_perfil as remetente_foto
+        FROM mensagens_chat m
+        JOIN usuarios u ON m.remetente_id = u.id
+        WHERE (m.remetente_id = ? AND m.destinatario_id = ?) OR (m.remetente_id = ? AND m.destinatario_id = ?)
+        ORDER BY m.data_envio ASC
+    ");
+    $stmt_msg->bind_param("iiii", $_SESSION['id'], $chat_usuario_id, $chat_usuario_id, $_SESSION['id']);
+    $stmt_msg->execute();
+    $mensagens = $stmt_msg->get_result()->fetch_all(MYSQLI_ASSOC);
+    
+    // Marcar como lidas
+    $stmt_lidas = $conexao->prepare("UPDATE mensagens_chat SET lida = 1 WHERE destinatario_id = ? AND remetente_id = ? AND lida = 0");
+    $stmt_lidas->bind_param("ii", $_SESSION['id'], $chat_usuario_id);
+    $stmt_lidas->execute();
+    $stmt_lidas->close();
+}
+
+// Contar mensagens não lidas no total
+$stmt_nao_lidas = $conexao->prepare("SELECT COUNT(*) as total FROM mensagens_chat WHERE destinatario_id = ? AND lida = 0");
+$stmt_nao_lidas->bind_param("i", $_SESSION['id']);
+$stmt_nao_lidas->execute();
+$total_nao_lidas = $stmt_nao_lidas->get_result()->fetch_assoc()['total'];
+
 // Upload de foto de perfil 
 if(isset($_POST['update_profile']) && isset($_FILES['foto']) && $_FILES['foto']['error'] == 0){
     $ext = strtolower(pathinfo($_FILES['foto']['name'], PATHINFO_EXTENSION));
@@ -313,11 +481,11 @@ if(isset($_GET['excluir'])){
 }
 
 // Buscar informações completas do usuário
-$stmt = $conexao->prepare("SELECT nome, email, foto_perfil, bio, telefone, data_nascimento, genero, localizacao, website, tema_preferido FROM usuarios WHERE id = ?");
-$stmt->bind_param("i", $_SESSION['id']);
-$stmt->execute();
-$result = $stmt->get_result();
-$usuario = $result->fetch_assoc();
+//$stmt = $conexao->prepare("SELECT nome, email, foto_perfil, bio, telefone, data_nascimento, genero, localizacao, website, tema_preferido FROM usuarios WHERE id = ?");
+//$stmt->bind_param("i", $_SESSION['id']);
+//$stmt->execute();
+//$result = $stmt->get_result();
+//$usuario = $result->fetch_assoc();
 
 // Buscar tarefas do usuário com ordenação
 $ordenacao = $_GET['ordenar'] ?? 'data_criacao';
@@ -924,6 +1092,441 @@ body {
         align-self: flex-end;
     }
 }
+/* NOVOS ESTILOS PARA NOTIFICAÇÕES */
+.notification-badge {
+    background: var(--danger-color);
+    color: white;
+    border-radius: 50%;
+    width: 20px;
+    height: 20px;
+    font-size: 0.7rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: absolute;
+    top: -5px;
+    right: -5px;
+}
+
+.notification-icon {
+    position: relative;
+    cursor: pointer;
+    font-size: 1.5rem;
+    padding: 10px;
+}
+
+.notification-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    width: 400px;
+    max-width: 90vw;
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    z-index: 1000;
+    display: none;
+}
+
+.notification-dropdown.show {
+    display: block;
+}
+
+.notification-header {
+    padding: 15px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.notification-list {
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.notification-item {
+    padding: 15px;
+    border-bottom: 1px solid var(--border-color);
+    cursor: pointer;
+    transition: background 0.3s ease;
+}
+
+.notification-item:hover {
+    background: rgba(0, 123, 255, 0.1);
+}
+
+.notification-item.unread {
+    background: rgba(0, 123, 255, 0.05);
+    border-left: 3px solid var(--primary-color);
+}
+
+.notification-title {
+    font-weight: bold;
+    margin-bottom: 5px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+}
+
+.notification-message {
+    color: var(--secondary-color);
+    font-size: 0.9rem;
+    margin-bottom: 5px;
+}
+
+.notification-time {
+    font-size: 0.8rem;
+    color: var(--secondary-color);
+}
+
+.notification-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 10px;
+}
+
+.notification-type {
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 0.7rem;
+    font-weight: bold;
+    margin-left: 10px;
+}
+
+.type-info { background: var(--info-color); color: white; }
+.type-sucesso { background: var(--success-color); color: white; }
+.type-alerta { background: var(--warning-color); color: black; }
+.type-erro { background: var(--danger-color); color: white; }
+
+.notification-footer {
+    padding: 15px;
+    border-top: 1px solid var(--border-color);
+    text-align: center;
+}
+
+/* Modal de Notificações */
+.notifications-modal .modal-content {
+    max-width: 800px;
+}
+
+.notification-filters {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}
+
+.notification-filter-btn {
+    padding: 8px 16px;
+    border: 1px solid var(--border-color);
+    background: var(--card-bg);
+    color: var(--text-color);
+    border-radius: 20px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.notification-filter-btn.active {
+    background: var(--primary-color);
+    color: white;
+    border-color: var(--primary-color);
+}
+
+.empty-notifications {
+    text-align: center;
+    padding: 40px;
+    color: var(--secondary-color);
+}
+
+.empty-notifications i {
+    font-size: 3rem;
+    margin-bottom: 15px;
+    display: block;
+}
+
+/* Responsividade */
+@media (max-width: 768px) {
+    .notification-dropdown {
+        width: 300px;
+        right: -50px;
+    }
+    
+    .notification-item {
+        padding: 10px;
+    }
+}
+/* SISTEMA DE CHAT */
+.chat-badge {
+    background: var(--danger-color);
+    color: white;
+    border-radius: 50%;
+    width: 20px;
+    height: 20px;
+    font-size: 0.7rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: absolute;
+    top: -5px;
+    right: -5px;
+}
+
+.chat-icon {
+    position: relative;
+    cursor: pointer;
+    font-size: 1.5rem;
+    padding: 10px;
+}
+
+.chat-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    width: 350px;
+    max-width: 90vw;
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    z-index: 1000;
+    display: none;
+}
+
+.chat-dropdown.show {
+    display: block;
+}
+
+.chat-header {
+    padding: 15px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.chat-list {
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.chat-user-item {
+    padding: 12px 15px;
+    border-bottom: 1px solid var(--border-color);
+    cursor: pointer;
+    transition: background 0.3s ease;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.chat-user-item:hover {
+    background: rgba(0, 123, 255, 0.1);
+}
+
+.chat-user-item.active {
+    background: rgba(0, 123, 255, 0.05);
+    border-left: 3px solid var(--primary-color);
+}
+
+.chat-user-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    object-fit: cover;
+}
+
+.chat-user-info {
+    flex: 1;
+}
+
+.chat-user-name {
+    font-weight: bold;
+    margin-bottom: 3px;
+}
+
+.chat-user-lastmsg {
+    font-size: 0.8rem;
+    color: var(--secondary-color);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.chat-user-badge {
+    background: var(--primary-color);
+    color: white;
+    border-radius: 50%;
+    width: 20px;
+    height: 20px;
+    font-size: 0.7rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.chat-footer {
+    padding: 15px;
+    border-top: 1px solid var(--border-color);
+    text-align: center;
+}
+
+/* Modal do Chat */
+.chat-modal .modal-content {
+    max-width: 800px;
+    height: 80vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.chat-container {
+    display: flex;
+    flex: 1;
+    height: 100%;
+}
+
+.chat-sidebar {
+    width: 300px;
+    border-right: 1px solid var(--border-color);
+    display: flex;
+    flex-direction: column;
+}
+
+.chat-conversations {
+    flex: 1;
+    overflow-y: auto;
+}
+
+.chat-messages {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 20px;
+}
+
+.chat-messages-header {
+    padding: 15px;
+    border-bottom: 1px solid var(--border-color);
+    text-align: center;
+    font-weight: bold;
+}
+
+.chat-messages-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 15px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.message-item {
+    display: flex;
+    margin-bottom: 15px;
+    max-width: 80%;
+}
+
+.message-item.own {
+    align-self: flex-end;
+    flex-direction: row-reverse;
+}
+
+.message-avatar {
+    width: 35px;
+    height: 35px;
+    border-radius: 50%;
+    object-fit: cover;
+    margin: 0 10px;
+}
+
+.message-content {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 15px;
+    padding: 10px 15px;
+    position: relative;
+}
+
+.message-item.own .message-content {
+    background: var(--primary-color);
+    color: white;
+}
+
+.message-text {
+    margin: 0;
+}
+
+.message-time {
+    font-size: 0.7rem;
+    opacity: 0.7;
+    margin-top: 5px;
+    text-align: right;
+}
+
+.chat-input-container {
+    padding: 15px;
+    border-top: 1px solid var(--border-color);
+    display: flex;
+    gap: 10px;
+}
+
+.chat-input {
+    flex: 1;
+    padding: 12px 15px;
+    border: 1px solid var(--border-color);
+    border-radius: 25px;
+    background: var(--card-bg);
+    color: var(--text-color);
+}
+
+.chat-send-btn {
+    background: var(--primary-color);
+    color: white;
+    border: none;
+    border-radius: 50%;
+    width: 45px;
+    height: 45px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.empty-chat {
+    text-align: center;
+    padding: 40px;
+    color: var(--secondary-color);
+}
+
+.empty-chat i {
+    font-size: 3rem;
+    margin-bottom: 15px;
+    display: block;
+}
+
+/* Responsividade Chat */
+@media (max-width: 768px) {
+    .chat-dropdown {
+        width: 300px;
+        right: -50px;
+    }
+    
+    .chat-container {
+        flex-direction: column;
+    }
+    
+    .chat-sidebar {
+        width: 100%;
+        height: 200px;
+        border-right: none;
+        border-bottom: 1px solid var(--border-color);
+    }
+    
+    .message-item {
+        max-width: 90%;
+    }
+}
 </style>
 </head>
 <body class="<?php echo isset($_SESSION['tema']) && $_SESSION['tema'] == 'escuro' ? 'dark-theme' : ''; ?>">
@@ -938,9 +1541,120 @@ body {
                 <div class="stat-item">⚡ Produtividade: <?php echo $estatisticas['total'] > 0 ? round(($estatisticas['concluidas'] / $estatisticas['total']) * 100) : 0; ?>%</div>
             </div>
         </div>
-        <div class="header-actions">
-            <a href="logout.php" class="btn btn-danger">Sair</a>
+           <div class="header-actions" style="display: flex; align-items: center; gap: 15px;">
+    <!-- Ícone do Chat -->
+    <div class="chat-icon" onclick="toggleChat()">
+        💬
+        <?php if($total_nao_lidas > 0): ?>
+            <span class="chat-badge"><?php echo $total_nao_lidas; ?></span>
+        <?php endif; ?>
+        
+        <!-- Dropdown do Chat -->
+        <div class="chat-dropdown" id="chatDropdown">
+            <div class="chat-header">
+                <h4 style="margin: 0;">Conversas</h4>
+                <span class="badge"><?php echo count($conversas); ?> conversas</span>
+            </div>
+            
+            <div class="chat-list">
+                <?php if(empty($conversas)): ?>
+                    <div class="empty-chat">
+                        <div>💬</div>
+                        <p>Nenhuma conversa</p>
+                    </div>
+                <?php else: ?>
+                    <?php foreach($conversas as $conversa): ?>
+                        <div class="chat-user-item" onclick="openChatModal(<?php echo $conversa['user_id']; ?>)">
+                            <img src="<?php echo !empty($conversa['foto_perfil']) ? htmlspecialchars($conversa['foto_perfil']) : 'uploads/default.png'; ?>" 
+                                 alt="Avatar" class="chat-user-avatar">
+                            <div class="chat-user-info">
+                                <div class="chat-user-name"><?php echo htmlspecialchars($conversa['nome']); ?></div>
+                                <div class="chat-user-lastmsg"><?php echo $conversa['total_mensagens']; ?> mensagens</div>
+                            </div>
+                            <?php if($conversa['nao_lidas'] > 0): ?>
+                                <span class="chat-user-badge"><?php echo $conversa['nao_lidas']; ?></span>
+                            <?php endif; ?>
+                        </div>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </div>
+            
+            <div class="chat-footer">
+                <a href="javascript:void(0)" onclick="openChatModal()" class="btn btn-primary btn-sm">
+                    Novo Chat
+                </a>
+            </div>
         </div>
+    </div>
+    
+    <!-- Ícone de Notificações -->
+    <div class="notification-icon" onclick="toggleNotifications()">
+        🔔
+        <?php if($notificacoes_nao_lidas > 0): ?>
+            <span class="notification-badge"><?php echo $notificacoes_nao_lidas; ?></span>
+        <?php endif; ?>
+        
+        <!-- Dropdown de Notificações -->
+        <div class="notification-dropdown" id="notificationDropdown">
+            <div class="notification-header">
+                <h4 style="margin: 0;">Notificações</h4>
+                <?php if($notificacoes_nao_lidas > 0): ?>
+                    <form method="post" style="margin: 0;">
+                        <button type="submit" name="marcar_todas_lidas" class="btn btn-sm btn-primary">
+                            Marcar todas como lidas
+                        </button>
+                    </form>
+                <?php endif; ?>
+            </div>
+            
+            <div class="notification-list">
+                <?php if(empty($notificacoes)): ?>
+                    <div class="empty-notifications">
+                        <div>🎉</div>
+                        <p>Nenhuma notificação</p>
+                    </div>
+                <?php else: ?>
+                    <?php foreach(array_slice($notificacoes, 0, 5) as $notificacao): ?>
+                        <div class="notification-item <?php echo !$notificacao['lida'] ? 'unread' : ''; ?>" 
+                             onclick="window.location.href='<?php echo $notificacao['link'] ?: 'sistema_usuario.php'; ?>'">
+                            <div class="notification-title">
+                                <span><?php echo htmlspecialchars($notificacao['titulo']); ?></span>
+                                <span class="notification-type type-<?php echo $notificacao['tipo']; ?>">
+                                    <?php echo ucfirst($notificacao['tipo']); ?>
+                                </span>
+                            </div>
+                            <div class="notification-message">
+                                <?php echo htmlspecialchars($notificacao['mensagem']); ?>
+                            </div>
+                            <div class="notification-time">
+                                <?php echo date('d/m/Y H:i', strtotime($notificacao['data_criacao'])); ?>
+                            </div>
+                            <div class="notification-actions">
+                                <?php if(!$notificacao['lida']): ?>
+                                    <a href="?marcar_lida=<?php echo $notificacao['id']; ?>" class="btn btn-success btn-sm">
+                                        Marcar como lida
+                                    </a>
+                                <?php endif; ?>
+                                <a href="?excluir_notificacao=<?php echo $notificacao['id']; ?>" class="btn btn-danger btn-sm" 
+                                   onclick="event.stopPropagation(); return confirm('Excluir esta notificação?')">
+                                    Excluir
+                                </a>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </div>
+            
+            <div class="notification-footer">
+                <a href="javascript:void(0)" onclick="openNotificationsModal()" class="btn btn-secondary btn-sm">
+                    Ver todas as notificações
+                </a>
+            </div>
+        </div>
+    </div>
+    
+    <a href="logout.php" class="btn btn-danger">Sair</a>
+</div>
     </div>
 
     <!-- Grid Principal -->
@@ -1357,6 +2071,201 @@ body {
                 </div>
             </div>
         </div>
+        <!-- Modal de Edição de Perfil -->
+<div class="modal" id="modalPerfil">
+    <div class="modal-content">
+        <!-- ... conteúdo do modal de perfil ... -->
+    </div>
+</div>
+
+<!-- Modal de Todas as Notificações -->
+<div class="modal notifications-modal" id="modalNotificacoes">
+    <div class="modal-content">
+        <span class="close-modal" onclick="closeNotificationsModal()">&times;</span>
+        <h2 style="margin-bottom: 25px; text-align: center;">Todas as Notificações</h2>
+        
+        <?php if(isset($sucesso_notificacao)): ?>
+            <div class="alert alert-success"><?php echo $sucesso_notificacao; ?></div>
+        <?php endif; ?>
+        
+        <div class="notification-filters">
+            <button class="notification-filter-btn active" onclick="filterNotifications('todas')">Todas</button>
+            <button class="notification-filter-btn" onclick="filterNotifications('nao-lidas')">Não lidas</button>
+            <button class="notification-filter-btn" onclick="filterNotifications('info')">Informação</button>
+            <button class="notification-filter-btn" onclick="filterNotifications('sucesso')">Sucesso</button>
+            <button class="notification-filter-btn" onclick="filterNotifications('alerta')">Alerta</button>
+            <button class="notification-filter-btn" onclick="filterNotifications('erro')">Erro</button>
+        </div>
+        
+        <div class="notification-list" id="allNotificationsList">
+            <?php if(empty($notificacoes)): ?>
+                <div class="empty-notifications">
+                    <div>🎉</div>
+                    <h3>Nenhuma notificação encontrada</h3>
+                    <p>Quando você tiver novas notificações, elas aparecerão aqui.</p>
+                </div>
+            <?php else: ?>
+                <?php foreach($notificacoes as $notificacao): ?>
+                    <div class="notification-item <?php echo !$notificacao['lida'] ? 'unread' : ''; ?> notification-<?php echo $notificacao['tipo']; ?>"
+                         data-type="<?php echo $notificacao['tipo']; ?>" 
+                         data-read="<?php echo $notificacao['lida'] ? 'lida' : 'nao-lida'; ?>">
+                        <div class="notification-title">
+                            <span><?php echo htmlspecialchars($notificacao['titulo']); ?></span>
+                            <span class="notification-type type-<?php echo $notificacao['tipo']; ?>">
+                                <?php echo ucfirst($notificacao['tipo']); ?>
+                            </span>
+                        </div>
+                        <div class="notification-message">
+                            <?php echo htmlspecialchars($notificacao['mensagem']); ?>
+                        </div>
+                        <div class="notification-time">
+                            <?php echo date('d/m/Y H:i', strtotime($notificacao['data_criacao'])); ?>
+                        </div>
+                        <div class="notification-actions">
+                            <?php if(!$notificacao['lida']): ?>
+                                <a href="?marcar_lida=<?php echo $notificacao['id']; ?>" class="btn btn-success btn-sm">
+                                    Marcar como lida
+                                </a>
+                            <?php endif; ?>
+                            <a href="?excluir_notificacao=<?php echo $notificacao['id']; ?>" class="btn btn-danger btn-sm" 
+                               onclick="return confirm('Excluir esta notificação?')">
+                                Excluir
+                            </a>
+                            <?php if($notificacao['link']): ?>
+                                <a href="<?php echo $notificacao['link']; ?>" class="btn btn-primary btn-sm">
+                                    Ver mais
+                                </a>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
+        
+        <div class="notification-footer">
+            <form method="post">
+                <button type="submit" name="marcar_todas_lidas" class="btn btn-primary">
+                    Marcar todas como lidas
+                </button>
+            </form>
+        </div>
+    </div>
+</div>
+</div> <!-- fecha modal Notificações -->
+
+<!-- ========== MODAL DO CHAT ========== -->
+
+<!-- Modal do Chat Completo -->
+<div class="modal chat-modal" id="modalChat">
+    <div class="modal-content">
+        <span class="close-modal" onclick="closeChatModal()">&times;</span>
+        <h2 style="margin-bottom: 20px; text-align: center;">Chat com Usuários</h2>
+        
+        <div class="chat-container">
+            <!-- Sidebar com lista de usuários -->
+            <div class="chat-sidebar">
+                <div class="chat-header">
+                    <h4 style="margin: 0;">Usuários</h4>
+                </div>
+                
+                <div class="chat-conversations">
+                    <?php if(empty($usuarios_chat)): ?>
+                        <div class="empty-chat">
+                            <div>👥</div>
+                            <p>Nenhum outro usuário</p>
+                        </div>
+                    <?php else: ?>
+                        <?php foreach($usuarios_chat as $user): ?>
+                            <?php 
+                            // Encontrar conversa com este usuário
+                            $user_conversa = null;
+                            $nao_lidas = 0;
+                            foreach($conversas as $conv) {
+                                if($conv['user_id'] == $user['id']) {
+                                    $user_conversa = $conv;
+                                    $nao_lidas = $conv['nao_lidas'];
+                                    break;
+                                }
+                            }
+                            ?>
+                            <div class="chat-user-item <?php echo isset($_GET['chat_com']) && $_GET['chat_com'] == $user['id'] ? 'active' : ''; ?>" 
+                                 onclick="loadChat(<?php echo $user['id']; ?>)">
+                                <img src="<?php echo !empty($user['foto_perfil']) ? htmlspecialchars($user['foto_perfil']) : 'uploads/default.png'; ?>" 
+                                     alt="Avatar" class="chat-user-avatar">
+                                <div class="chat-user-info">
+                                    <div class="chat-user-name"><?php echo htmlspecialchars($user['nome']); ?></div>
+                                    <div class="chat-user-lastmsg">
+                                        <?php if($user_conversa): ?>
+                                            <?php echo $user_conversa['total_mensagens']; ?> mensagens
+                                        <?php else: ?>
+                                            Iniciar conversa
+                                        <?php endif; ?>
+                                    </div>
+                                </div>
+                                <?php if($nao_lidas > 0): ?>
+                                    <span class="chat-user-badge"><?php echo $nao_lidas; ?></span>
+                                <?php endif; ?>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+            
+            <!-- Área de mensagens -->
+            <div class="chat-messages">
+                <?php if($chat_usuario): ?>
+                    <div class="chat-messages-header">
+                        Conversa com <strong><?php echo htmlspecialchars($chat_usuario['nome']); ?></strong>
+                    </div>
+                    
+                    <div class="chat-messages-list" id="chatMessagesList">
+                        <?php if(empty($mensagens)): ?>
+                            <div class="empty-chat">
+                                <div>💬</div>
+                                <p>Nenhuma mensagem ainda</p>
+                                <small>Envie a primeira mensagem!</small>
+                            </div>
+                        <?php else: ?>
+                            <?php foreach($mensagens as $msg): ?>
+                                <div class="message-item <?php echo $msg['remetente_id'] == $_SESSION['id'] ? 'own' : ''; ?>">
+                                    <img src="<?php echo !empty($msg['remetente_foto']) ? htmlspecialchars($msg['remetente_foto']) : 'uploads/default.png'; ?>" 
+                                         alt="Avatar" class="message-avatar">
+                                    <div class="message-content">
+                                        <p class="message-text"><?php echo htmlspecialchars($msg['mensagem']); ?></p>
+                                        <div class="message-time">
+                                            <?php echo date('H:i', strtotime($msg['data_envio'])); ?>
+                                            <?php if($msg['remetente_id'] != $_SESSION['id'] && $msg['lida']): ?>
+                                                ✓✓
+                                            <?php elseif($msg['remetente_id'] == $_SESSION['id']): ?>
+                                                <?php echo $msg['lida'] ? '✓✓' : '✓'; ?>
+                                            <?php endif; ?>
+                                        </div>
+                                    </div>
+                                </div>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </div>
+                    
+                    <form method="post" class="chat-input-container">
+                        <input type="hidden" name="destinatario_id" value="<?php echo $chat_usuario['id']; ?>">
+                        <input type="text" name="mensagem" class="chat-input" placeholder="Digite sua mensagem..." required>
+                        <button type="submit" name="enviar_mensagem" class="chat-send-btn">
+                            ➤
+                        </button>
+                    </form>
+                <?php else: ?>
+                    <div class="empty-chat" style="flex: 1; display: flex; align-items: center; justify-content: center;">
+                        <div>
+                            <div style="font-size: 4rem;">💬</div>
+                            <h3>Selecione um usuário para conversar</h3>
+                            <p>Escolha alguém da lista ao lado para iniciar uma conversa</p>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+</div>
 <script>
 // Modal Functions
 function openModal(){ 
@@ -1603,6 +2512,213 @@ setInterval(() => {
     })
     .catch(err => console.error('Erro no heartbeat:', err));
 }, 30000);
+// NOVAS FUNÇÕES PARA NOTIFICAÇÕES
+
+// Toggle do dropdown de notificações
+function toggleNotifications() {
+    const dropdown = document.getElementById('notificationDropdown');
+    dropdown.classList.toggle('show');
+    
+    // Fechar outros dropdowns
+    document.querySelectorAll('.notification-dropdown').forEach(otherDropdown => {
+        if(otherDropdown !== dropdown) {
+            otherDropdown.classList.remove('show');
+        }
+    });
+}
+
+// Fechar dropdown ao clicar fora
+document.addEventListener('click', function(event) {
+    if(!event.target.closest('.notification-icon')) {
+        document.querySelectorAll('.notification-dropdown').forEach(dropdown => {
+            dropdown.classList.remove('show');
+        });
+    }
+});
+
+// Modal de todas as notificações
+function openNotificationsModal() {
+    document.getElementById('modalNotificacoes').style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+    // Fechar dropdown
+    document.getElementById('notificationDropdown').classList.remove('show');
+}
+
+function closeNotificationsModal() {
+    document.getElementById('modalNotificacoes').style.display = 'none';
+    document.body.style.overflow = 'auto';
+}
+
+// Filtrar notificações
+function filterNotifications(filter) {
+    const notifications = document.querySelectorAll('#allNotificationsList .notification-item');
+    const filterButtons = document.querySelectorAll('.notification-filter-btn');
+    
+    // Ativar botão selecionado
+    filterButtons.forEach(btn => btn.classList.remove('active'));
+    event.target.classList.add('active');
+    
+    notifications.forEach(notification => {
+        switch(filter) {
+            case 'todas':
+                notification.style.display = 'block';
+                break;
+            case 'nao-lidas':
+                notification.style.display = notification.getAttribute('data-read') === 'nao-lida' ? 'block' : 'none';
+                break;
+            default:
+                notification.style.display = notification.getAttribute('data-type') === filter ? 'block' : 'none';
+                break;
+        }
+    });
+}
+
+// Verificar novas notificações a cada 30 segundos
+setInterval(() => {
+    // Em uma implementação real, isso faria uma requisição AJAX
+    console.log('Verificando novas notificações...');
+}, 30000);
+// =============================================
+// SISTEMA DE CHAT - JAVASCRIPT CORRIGIDO
+// =============================================
+
+// Toggle do dropdown do chat
+function toggleChat() {
+    const dropdown = document.getElementById('chatDropdown');
+    const isShowing = dropdown.classList.contains('show');
+    
+    // Fechar todos os dropdowns primeiro
+    document.querySelectorAll('.chat-dropdown, .notification-dropdown').forEach(dropdown => {
+        dropdown.classList.remove('show');
+    });
+    
+    // Se não estava mostrando, agora mostra
+    if (!isShowing) {
+        dropdown.classList.add('show');
+    }
+}
+
+// Fechar dropdown ao clicar fora
+document.addEventListener('click', function(event) {
+    if (!event.target.closest('.chat-icon') && !event.target.closest('.chat-dropdown')) {
+        document.getElementById('chatDropdown').classList.remove('show');
+    }
+    if (!event.target.closest('.notification-icon') && !event.target.closest('.notification-dropdown')) {
+        document.getElementById('notificationDropdown').classList.remove('show');
+    }
+});
+
+// Modal do chat
+function openChatModal(userId = null) {
+    document.getElementById('modalChat').style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+    
+    // Fechar dropdowns
+    document.getElementById('chatDropdown').classList.remove('show');
+    document.getElementById('notificationDropdown').classList.remove('show');
+    
+    // Se um usuário foi especificado e é diferente do atual, carregar o chat
+    if (userId) {
+        const currentChat = new URLSearchParams(window.location.search).get('chat_com');
+        if (currentChat != userId) {
+            loadChat(userId);
+        }
+    }
+}
+
+function closeChatModal() {
+    document.getElementById('modalChat').style.display = 'none';
+    document.body.style.overflow = 'auto';
+    
+    // Limpar parâmetro da URL sem recarregar a página
+    if (window.history.replaceState) {
+        const url = new URL(window.location);
+        url.searchParams.delete('chat_com');
+        window.history.replaceState({}, '', url);
+    }
+}
+
+// Carregar chat com usuário específico (CORRIGIDO - EVITA LOOP)
+function loadChat(userId) {
+    // Verifica se já está no mesmo chat para evitar loop
+    const urlParams = new URLSearchParams(window.location.search);
+    const currentChat = urlParams.get('chat_com');
+    
+    if (currentChat != userId) {
+        // Usa replaceState para atualizar a URL
+        if (window.history.replaceState) {
+            const url = new URL(window.location);
+            url.searchParams.set('chat_com', userId);
+            window.history.replaceState({}, '', url);
+        }
+        
+        // Recarrega a página apenas uma vez
+        window.location.reload();
+    }
+}
+
+// Auto-scroll para baixo nas mensagens
+function scrollToBottom() {
+    const messagesList = document.getElementById('chatMessagesList');
+    if (messagesList) {
+        messagesList.scrollTop = messagesList.scrollHeight;
+    }
+}
+
+// Inicializar chat quando modal abrir
+document.addEventListener('DOMContentLoaded', function() {
+    // Scroll para baixo se houver mensagens (após um pequeno delay)
+    setTimeout(scrollToBottom, 300);
+    
+    // Verificar se deve abrir o modal automaticamente
+    const urlParams = new URLSearchParams(window.location.search);
+    const chatCom = urlParams.get('chat_com');
+    
+    if (chatCom) {
+        // Pequeno delay para garantir que tudo carregou
+        setTimeout(() => {
+            openChatModal(parseInt(chatCom));
+        }, 500);
+    }
+});
+
+// Fechar modal com ESC
+document.addEventListener('keydown', function(event) {
+    if (event.key === 'Escape') {
+        closeChatModal();
+        if (typeof closeNotificationsModal === 'function') {
+            closeNotificationsModal();
+        }
+        if (document.getElementById('modalPerfil') && typeof closeModal === 'function') {
+            closeModal();
+        }
+    }
+});
+
+// Fechar modal ao clicar no backdrop
+document.addEventListener('click', function(event) {
+    if (event.target.classList.contains('modal')) {
+        closeChatModal();
+        if (typeof closeNotificationsModal === 'function') {
+            closeNotificationsModal();
+        }
+        if (document.getElementById('modalPerfil') && typeof closeModal === 'function') {
+            closeModal();
+        }
+    }
+});
+
+// Envio de mensagem com AJAX (opcional - para melhor experiência)
+function sendMessageQuick(form) {
+    const messageInput = form.querySelector('input[name="mensagem"]');
+    const message = messageInput.value.trim();
+    
+    if (message === '') return false;
+    
+    // Aqui você pode adicionar AJAX para enviar sem recarregar a página
+    // Por enquanto, vamos usar o envio normal por form
+    return true;
+}
 </script>
 </body>
 </html>
